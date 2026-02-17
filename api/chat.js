@@ -1,28 +1,25 @@
 export const config = {
-  maxDuration: 60,
+  maxDuration: 30,
 };
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "POST only" });
-  }
+  if (req.method !== "POST") return res.status(405).end();
 
-  const { messages } = req.body;
-  const userMessage = messages[messages.length - 1].content;
+  const { messages } = await req.body;
+  const userQuery = messages[messages.length - 1].content;
 
-  // DuckDuckGo Context
+  // --- DuckDuckGo Context ---
   let context = "";
   try {
-    const ddg = await fetch(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(userMessage)}&format=json&no_html=1`
+    const search = await fetch(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(userQuery)}&format=json&no_html=1`
     );
-    const ddgData = await ddg.json();
-    context = ddgData.AbstractText || "";
-  } catch (e) {
+    const sData = await search.json();
+    context = sData.AbstractText || "";
+  } catch {
     context = "";
   }
 
-  // === MODEL TIERS ===
   const FAST = [
     "stepfun/step-3.5-flash:free",
     "nvidia/nemotron-nano-9b-v2:free",
@@ -47,74 +44,76 @@ export default async function handler(req, res) {
     "openai/gpt-oss-120b:free"
   ];
 
-  async function tryModel(model, timeout) {
+  const controllers = [];
+
+  async function callModel(model) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
+    controllers.push(controller);
 
-    try {
-      const response = await fetch(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            "Content-Type": "application/json",
-            "X-Title": "Honest25-AI"
-          },
-          body: JSON.stringify({
-            model: model,
-            messages: [
-              {
-                role: "system",
-                content: `You are Honest25-AI. Use this web context if useful: ${context}`
-              },
-              ...messages
-            ],
-            max_tokens: 500
-          })
-        }
-      );
-
-      clearTimeout(timer);
-
-      const data = await response.json();
-      if (data.choices?.[0]?.message?.content) {
-        return {
-          reply: data.choices[0].message.content,
-          modelUsed: model
-        };
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "X-Title": "Honest25-AI"
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: `You are Honest25-AI. Use this context if helpful: ${context}`
+            },
+            ...messages
+          ]
+        })
       }
-    } catch (err) {
-      return null;
-    }
+    );
 
-    return null;
+    const data = await response.json();
+    if (!data.choices) throw new Error("No reply");
+
+    return {
+      reply: data.choices[0].message.content,
+      model
+    };
   }
 
-  // ===== EXECUTION ORDER =====
-
-  // FAST MODELS (2s each)
-  for (const model of FAST) {
-    const result = await tryModel(model, 2000);
-    if (result) return res.status(200).json(result);
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // BALANCED MODELS (4s each)
-  for (const model of BALANCED) {
-    const result = await tryModel(model, 4000);
-    if (result) return res.status(200).json(result);
-  }
+  try {
+    const fastRace = Promise.race(FAST.map(m => callModel(m)));
 
-  // HEAVY MODELS (no timeout = final thinking)
-  for (const model of HEAVY) {
-    const result = await tryModel(model, 15000);
-    if (result) return res.status(200).json(result);
-  }
+    const balancedRace = delay(2000).then(() =>
+      Promise.race(BALANCED.map(m => callModel(m)))
+    );
 
-  return res.status(500).json({
-    reply: "All models failed.",
-    modelUsed: "none"
-  });
+    const heavyRace = delay(4000).then(() =>
+      Promise.race(HEAVY.map(m => callModel(m)))
+    );
+
+    const winner = await Promise.race([
+      fastRace,
+      balancedRace,
+      heavyRace
+    ]);
+
+    // Abort all other requests
+    controllers.forEach(c => c.abort());
+
+    return res.status(200).json(winner);
+
+  } catch (err) {
+    return res.status(500).json({
+      reply: "Honest25-AI: All models are busy.",
+      model: "none"
+    });
+  }
 }
+
 
