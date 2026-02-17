@@ -1,4 +1,4 @@
-export const config = { maxDuration: 60 }; // Vercel timeout buffer
+export const config = { maxDuration: 90 }; // Give room for full loop
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
@@ -6,53 +6,59 @@ export default async function handler(req, res) {
   const { messages } = await req.json();
   const query = messages[messages.length - 1].content;
 
-  // DuckDuckGo context for better answers
-  let context = '';
+  // Optional DuckDuckGo context (helps answers, low overhead)
+  let context = 'General knowledge mode.';
   try {
-    const searchRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`);
-    const data = await searchRes.json();
-    context = data.AbstractText || '';
-    if (data.RelatedTopics?.length) context += '\nRelated: ' + data.RelatedTopics.slice(0, 2).map(t => t.Text).join('; ');
+    const search = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`);
+    const data = await search.json();
+    context = data.AbstractText || context;
   } catch {}
 
-  // Your tiered stack + ultimate free fallback
+  // Full model list you provided, ordered fast → balanced → heavy
   const modelStack = [
+    // Fastest first (most likely to respond quick)
     'stepfun/step-3.5-flash:free',
     'nvidia/nemotron-nano-9b-v2:free',
     'google/gemma-3-4b-it:free',
     'meta-llama/llama-3.2-3b-instruct:free',
     'qwen/qwen3-4b:free',
+    // Balanced
     'google/gemma-3-12b-it:free',
     'mistralai/mistral-small-3.1-24b-instruct:free',
     'z-ai/glm-4.5-air:free',
     'upstage/solar-pro-3:free',
     'nvidia/nemotron-3-nano-30b-a3b:free',
+    // Heavy / reliable last
     'deepseek/deepseek-r1-0528:free',
     'meta-llama/llama-3.3-70b-instruct:free',
     'nousresearch/hermes-3-llama-3.1-405b:free',
     'qwen/qwen3-next-80b-a3b-instruct:free',
     'openai/gpt-oss-120b:free',
-    'openrouter/free' // Always-available emergency
+    'arcee-ai/trinity-large-preview:free',
+    'arcee-ai/trinity-mini:free',
+    'google/gemma-3-27b-it:free',
+    'liquid/lfm-2.5-1.2b-instruct:free',
+    'openrouter/free'  // Ultimate fallback – always works, though basic
   ];
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  let replied = false;
-  let modelUsed = '';
+  let success = false;
+  let usedModel = '';
 
   for (const model of modelStack) {
-    if (replied) break;
+    if (success) break;
 
-    // Live status to UI
-    res.write(`data: ${JSON.stringify({ status: `Trying ${model.replace(/:free$/, '').split('/').pop()} (fast provider)...` })}\n\n`);
+    // Tell UI what's happening
+    res.write(`data: ${JSON.stringify({ status: `Trying ${model.replace(':free', '')}...` })}\n\n`);
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s max for first token
+      const timeout = setTimeout(() => controller.abort(), 6000); // 6 seconds max per model attempt
 
-      const apiRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         signal: controller.signal,
         headers: {
@@ -63,58 +69,57 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           model,
           messages: [
-            { role: 'system', content: `You are Honest25-AI, a helpful assistant. ${context ? 'Context: ' + context : ''} Respond naturally and concisely.` },
+            { role: 'system', content: `You are Honest25-AI. Context if useful: ${context}. Be friendly and short.` },
             ...messages,
           ],
           stream: true,
-          provider: { // Latency optimization per attempt
-            sort: 'latency', // Prefer low-latency providers
-            preferredMaxLatency: { p90: 3 } // Aim for <3s p90 latency
-          }
+          temperature: 0.7,
         }),
       });
 
-      clearTimeout(timeoutId);
+      clearTimeout(timeout);
 
-      if (!apiRes.ok) throw new Error(`Status: ${apiRes.status}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      const reader = apiRes.body.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+
         const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(l => l.trim());
+        const lines = chunk.split('\n');
 
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             const dataStr = line.slice(6).trim();
             if (dataStr === '[DONE]') continue;
+
             try {
               const parsed = JSON.parse(dataStr);
               const delta = parsed.choices?.[0]?.delta?.content || '';
               if (delta) {
                 res.write(`data: ${JSON.stringify({ content: delta })}\n\n`);
-                replied = true;
-                modelUsed = model;
+                success = true;
+                usedModel = model;
               }
-            } catch {}
+            } catch (parseErr) {}
           }
         }
       }
     } catch (err) {
-      console.error(`Fallback triggered for ${model}: ${err.message}`);
-      if (!replied) {
-        res.write(`data: ${JSON.stringify({ status: `Slow – jumping to next...` })}\n\n`);
+      console.log(`Model ${model} failed/timeout: ${err.message}`);
+      if (!success) {
+        res.write(`data: ${JSON.stringify({ status: `Slow – next model...` })}\n\n`);
       }
     }
   }
 
-  if (replied) {
-    res.write(`data: ${JSON.stringify({ done: true, modelUsed: modelUsed.replace(/:free$/, '') })}\n\n`);
+  if (success) {
+    res.write(`data: ${JSON.stringify({ done: true, modelUsed: usedModel.replace(':free', '') })}\n\n`);
   } else {
-    res.write(`data: ${JSON.stringify({ content: 'All models overloaded. Please try again shortly.' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ content: 'Sorry, all models are slow/overloaded right now. Try again in a few minutes.' })}\n\n`);
   }
 
   res.end();
