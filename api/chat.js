@@ -74,8 +74,12 @@ export default async function handler(req, res) {
 
   // 🔥 FAST MODELS (2.5 sec each)
   const fastModels = [
+    "google/gemini-3.1-pro-preview",
+    "anthropic/claude-sonnet-4.6",
+    "deepseek/deepseek-chat-v3-0324",
     "nvidia/nemotron-nano-9b-v2:free",
     "stepfun/step-3.5-flash:free",
+    "openai/gpt-5-chat",
     "google/gemma-3-4b-it:free",
     "meta-llama/llama-3.2-3b-instruct:free",
     "qwen/qwen3-4b:free"
