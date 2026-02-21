@@ -74,8 +74,9 @@ export default async function handler(req, res) {
 
   // 🔥 FAST MODELS (2.5 sec each)
   const fastModels = [
-    "stepfun/step-3.5-flash:free",
     "nvidia/nemotron-nano-9b-v2:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free"
+    "stepfun/step-3.5-flash:free",
     "google/gemma-3-4b-it:free",
     "meta-llama/llama-3.2-3b-instruct:free",
     "qwen/qwen3-4b:free"
